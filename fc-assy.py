@@ -5,6 +5,7 @@ Commands:
   fc-assy.py show <paths...>          classify files and list assembly deps
   fc-assy.py mv <srcs...> <dst>       move/rename files, updating all XLink
                                       references in the tree rooted at cwd
+                                      (override with --root)
 
 mv semantics: a FILE source behaves like mv (into dst if dst is an
 existing dir, else rename). A DIRECTORY source always maps its contents
@@ -23,6 +24,7 @@ import os
 import posixpath
 import re
 import sys
+import time
 import zipfile
 
 XLINK_TAG_RE = re.compile(r'<XLink\w*\b[^>]*>')
@@ -44,12 +46,20 @@ def warn(msg):
 
 def find_fcstd(root):
     out = []
+    t0 = time.monotonic()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d != '.git']
+        if not find_fcstd.warned and time.monotonic() - t0 > 5:
+            warn(f'still scanning {root} for .FCStd files; '
+                 f'if this tree is mostly unrelated, pass --root to narrow it')
+            find_fcstd.warned = True
         for f in filenames:
             if f.endswith('.FCStd'):
                 out.append(os.path.join(dirpath, f))
     return sorted(out)
+
+
+find_fcstd.warned = False
 
 
 def load_doc(path):
@@ -170,15 +180,20 @@ def expand_moves(srcs, dst):
     return moves, plain
 
 
-def cmd_mv(srcs, dst):
-    root = os.getcwd()
+def cmd_mv(srcs, dst, root):
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        fail(f'--root {root}: not a directory')
     moves, plain_moves = expand_moves(srcs, dst)
     all_moves = {**moves, **plain_moves}
     if not all_moves:
         fail('nothing to move')
 
-    # -- validate the move map itself
+    # -- validate the move map itself; sources must be inside the tree too,
+    #    or their own outgoing links would escape rewriting
     for src, d in all_moves.items():
+        if not os.path.commonpath([src, root]) == root:
+            fail(f'source {src} is outside the tree rooted at {root}')
         if not os.path.commonpath([d, root]) == root:
             fail(f'destination {d} is outside the tree rooted at {root}')
         if src == d:
@@ -317,6 +332,10 @@ def main():
     ps = sub.add_parser('show', help='classify files and list assembly deps')
     ps.add_argument('paths', nargs='+')
     pm = sub.add_parser('mv', help='move/rename files, updating references')
+    pm.add_argument('--root', default='.',
+                    help='tree to scan for referring documents and to keep '
+                         'consistent (default: cwd); links from outside are '
+                         'the caller\'s responsibility')
     pm.add_argument('paths', nargs='+', metavar='SRC... DST')
     args = ap.parse_args()
     if args.cmd == 'show':
@@ -324,7 +343,7 @@ def main():
     else:
         if len(args.paths) < 2:
             fail('mv needs at least one source and a destination')
-        cmd_mv(args.paths[:-1], args.paths[-1])
+        cmd_mv(args.paths[:-1], args.paths[-1], args.root)
 
 
 if __name__ == '__main__':
