@@ -29,6 +29,10 @@ import zipfile
 
 XLINK_TAG_RE = re.compile(r'<XLink\w*\b[^>]*>')
 FILE_ATTR_RE = re.compile(r'file="([^"]*)"')
+# FreeCAD saves the last recompute error message verbatim on the object tag
+# (e.g. "Link broken! ... File: ../x.FCStd"). Informational only; FreeCAD
+# regenerates it on recompute, so it is neither a reference nor rewritten.
+OBJ_ERROR_ATTR_RE = re.compile(r'(?<=<Object )([^>]*?)Error="[^"]*"')
 OBJ_TYPE_RE = re.compile(r'<Object type="([^"]+)"')
 GEOM_PREFIXES = ('PartDesign::', 'Part::', 'Sketcher::', 'Mesh::')
 ASSY_PREFIXES = ('Assembly::',)
@@ -263,6 +267,12 @@ def cmd_mv(srcs, dst, root):
                 stripped = XLINK_TAG_RE.sub(
                     lambda m: FILE_ATTR_RE.sub('file=""', m.group(0)),
                     xml)
+                errors = [m.group(0) for m in OBJ_ERROR_ATTR_RE.finditer(stripped)]
+                if any('.FCStd' in e for e in errors):
+                    warn(f'{os.path.relpath(p)}: has saved recompute errors '
+                         f'mentioning .FCStd (stale "Link broken!" messages?); '
+                         f'left as-is, recompute and save in FreeCAD to clear')
+                stripped = OBJ_ERROR_ATTR_RE.sub(r'\1Error=""', stripped)
                 if '.FCStd' in stripped:
                     fail(f'{os.path.relpath(p)}: Document.xml mentions .FCStd '
                          f'outside XLink file attributes; update this tool')
