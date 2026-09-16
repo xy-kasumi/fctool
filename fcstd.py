@@ -6,10 +6,9 @@ import io
 import os
 import posixpath
 import zipfile
-from typing import Literal, cast
-from xml.dom import minidom
-from xml.dom.minidom import Document, Element
-from xml.parsers.expat import ExpatError
+from typing import Literal
+from xml.etree import ElementTree as ET
+from xml.etree.ElementTree import Element
 
 DocumentKind = Literal['part', 'assy', 'combined', 'unknown']
 
@@ -29,36 +28,81 @@ class FCStdError(Exception):
 
 def _element_name(element: Element) -> str:
     """Return an element's local name, including for namespace-aware XML."""
-    return element.localName or element.tagName
+    tag = element.tag
+    if not isinstance(tag, str):  # comments and processing instructions
+        return ''
+    return tag.rsplit('}', 1)[-1].split(':', 1)[-1]
 
 
 def _is_xlink(element: Element) -> bool:
     return _element_name(element).startswith('XLink')
 
 
-def _validate_references(document: Document, path: str) -> bool:
-    """Reject FCStd mentions outside XLink paths and saved errors."""
-    scrubbed = cast(Document, document.cloneNode(deep=True))
-    has_saved_error = False
-    for element in scrubbed.getElementsByTagName('*'):
-        if _is_xlink(element) and element.hasAttribute('file'):
-            element.setAttribute('file', '')
-        if (_element_name(element) == 'Object'
-                and element.hasAttribute('Error')):
-            has_saved_error |= '.FCStd' in element.getAttribute('Error')
-            element.setAttribute('Error', '')
+def _unsupported_reference(path: str) -> FCStdError:
+    return FCStdError(f'{path}: Document.xml mentions .FCStd outside '
+                      f'XLink file attributes; update this tool')
 
-    if '.FCStd' in scrubbed.toxml():
-        raise FCStdError(f'{path}: Document.xml mentions .FCStd outside '
-                         f'XLink file attributes; update this tool')
+
+class _TreeBuilder(ET.TreeBuilder):
+    """Preserve XML nodes and reject references outside the element tree.
+
+    ElementTree omits comments/PIs outside the root and namespace declaration
+    attributes from the returned tree. Check those parser events here; the
+    ordinary elements, attributes, and text are checked after parsing.
+    """
+
+    def __init__(self, path: str) -> None:
+        super().__init__(insert_comments=True, insert_pis=True)
+        self.path = path
+
+    def comment(self, text: str) -> Element | None:
+        if '.FCStd' in text:
+            raise _unsupported_reference(self.path)
+        return super().comment(text)
+
+    def pi(self, target: str, text: str | None = None) -> Element | None:
+        if '.FCStd' in target or (text is not None and '.FCStd' in text):
+            raise _unsupported_reference(self.path)
+        return super().pi(target, text)
+
+    def start_ns(self, prefix: str, uri: str) -> None:
+        if '.FCStd' in prefix or '.FCStd' in uri:
+            raise _unsupported_reference(self.path)
+
+    def doctype(self, name: str, pubid: str | None,
+                system: str | None) -> None:
+        if any(value is not None and '.FCStd' in value
+               for value in (name, pubid, system)):
+            raise _unsupported_reference(self.path)
+
+
+def _validate_references(document: Element, path: str) -> bool:
+    """Reject FCStd mentions outside XLink paths and saved errors."""
+    has_saved_error = False
+    for element in document.iter():
+        name = _element_name(element)
+        if isinstance(element.tag, str) and '.FCStd' in element.tag:
+            raise _unsupported_reference(path)
+        if ((element.text is not None and '.FCStd' in element.text)
+                or (element.tail is not None and '.FCStd' in element.tail)):
+            raise _unsupported_reference(path)
+        for attr, value in element.attrib.items():
+            allowed_link = _is_xlink(element) and attr == 'file'
+            allowed_error = name == 'Object' and attr == 'Error'
+            if '.FCStd' in attr or ('.FCStd' in value
+                                    and not allowed_link
+                                    and not allowed_error):
+                raise _unsupported_reference(path)
+            if allowed_error:
+                has_saved_error |= '.FCStd' in value
     return has_saved_error
 
 
-def _classify(document: Document, has_links: bool) -> DocumentKind:
+def _classify(document: Element, has_links: bool) -> DocumentKind:
     types = {
-        element.getAttribute('type')
-        for element in document.getElementsByTagName('*')
-        if _element_name(element) == 'Object' and element.hasAttribute('type')
+        element.get('type', '')
+        for element in document.iter()
+        if _element_name(element) == 'Object' and 'type' in element.attrib
     }
     has_geom = any(value.startswith(GEOM_PREFIXES) for value in types)
     has_assy = (any(value.startswith(ASSY_PREFIXES) for value in types)
@@ -80,7 +124,7 @@ def _classify(document: Document, has_links: bool) -> DocumentKind:
 class FCStdDocument:
     """An in-memory .FCStd document. Create instances with read()."""
 
-    def __init__(self, members: dict[str, bytes], document: Document,
+    def __init__(self, members: dict[str, bytes], document: Element,
                  links: list[tuple[Element, str, str]], kind: DocumentKind,
                  has_saved_error: bool) -> None:
         self._members = members
@@ -120,8 +164,9 @@ class FCStdDocument:
             raise FCStdError(f'{abspath}: Document.xml is not valid UTF-8') \
                 from exc
         try:
-            document = minidom.parseString(xml)
-        except (ExpatError, ValueError) as exc:
+            parser = ET.XMLParser(target=_TreeBuilder(abspath))
+            document = ET.fromstring(xml, parser=parser)
+        except (ET.ParseError, ValueError) as exc:
             raise FCStdError(f'{abspath}: Document.xml is not well-formed XML '
                              f'({exc})') from exc
 
@@ -134,10 +179,10 @@ class FCStdDocument:
 
         links: list[tuple[Element, str, str]] = []
         doc_dir = os.path.dirname(abspath)
-        for element in document.getElementsByTagName('*'):
-            if not _is_xlink(element) or not element.hasAttribute('file'):
+        for element in document.iter():
+            if not _is_xlink(element) or 'file' not in element.attrib:
                 continue
-            ref = element.getAttribute('file')
+            ref = element.get('file', '')
             if not ref:
                 continue
             if posixpath.isabs(ref) or (len(ref) > 1 and ref[1] == ':'):
@@ -206,8 +251,15 @@ class FCStdDocument:
             xml_bytes = self._members['Document.xml']
         else:
             for (element, _, _), ref in zip(self._links, refs, strict=True):
-                element.setAttribute('file', ref)
-            xml_bytes = self._document.toxml(encoding='utf-8')
+                element.set('file', ref)
+            # Match minidom's compact lexical style. ElementTree otherwise
+            # inserts a newline after a single-quoted declaration and spaces
+            # before ``/>``; neither is useful in FreeCAD's Document.xml and
+            # both would make unrelated content appear changed.
+            body = ET.tostring(self._document, encoding='utf-8',
+                               short_empty_elements=True)
+            xml_bytes = (b'<?xml version="1.0" encoding="utf-8"?>'
+                         + body.replace(b' />', b'/>'))
 
         buf = io.BytesIO()
         try:

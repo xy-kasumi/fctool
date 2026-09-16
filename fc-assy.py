@@ -161,7 +161,9 @@ def cmd_show(paths):
             warn(f'{p}: not an existing .FCStd file, ignored')
             continue
         requested.append(os.path.abspath(p))
-    ws = prepare_workspace(os.getcwd(), requested)
+    # Forward traversal needs no global reverse-reference index. Load only
+    # requested documents and dependencies actually reached from them.
+    ws = Workspace(os.path.abspath(os.getcwd()))
     for abspath in requested:
         show_tree(abspath, depth=0, seen=set(), ws=ws)
 
