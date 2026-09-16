@@ -18,15 +18,23 @@ dst/src/f. To nest, name the destination explicitly: mv src dst/src
 
 mv is all-or-nothing: every validation runs against an in-memory result
 first; the filesystem is only touched after everything checks out.
-The tool operates with partial knowledge of the FCStd schema, so any
-".FCStd" byte sequence it does not positively understand aborts the
-operation (update this tool rather than risk silent breakage).
+
+Each .FCStd archive is loaded and validated independently. An archive the
+tool cannot safely understand (malformed ZIP, ".FCStd" byte sequences
+outside XLink file attributes, absolute stored links, ...) is recorded as
+a per-document load error and only fails a command when it is explicitly
+requested, reached by show traversal, or otherwise needed by mv. Unrelated
+broken archives never abort an operation, and mv never rewrites an archive
+it could not load.
 """
+
+from __future__ import annotations
 
 import argparse
 import os
 import sys
 import time
+from typing import Iterable
 
 import fcstd
 
@@ -58,38 +66,122 @@ def find_fcstd(root):
 find_fcstd.warned = False
 
 
+# ---------------------------------------------------------------- workspace
+
+class Workspace:
+    """Tolerant index of .FCStd documents under a scan root.
+
+    Successfully loaded documents are cached by absolute path, load errors
+    are retained by absolute path (one bad archive never aborts preparation),
+    and a reverse ``absolute target -> referring documents`` index is built
+    from the successfully loaded documents' links only. A malformed file
+    contributes no reverse edges because its links are unknowable.
+    """
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+        self.documents: dict[str, fcstd.FCStdDocument] = {}
+        self.errors: dict[str, fcstd.FCStdError] = {}
+        self._referrers: dict[str, set[str]] = {}
+
+    def _index(self, path: str, doc: fcstd.FCStdDocument) -> None:
+        """Cache a successfully loaded document and its reverse edges."""
+        self.documents[path] = doc
+        for target in doc.links():
+            self._referrers.setdefault(target, set()).add(path)
+
+    def document(self, path: str) -> fcstd.FCStdDocument | None:
+        """Return the cached document for ``path``.
+
+        Returns ``None`` for a missing path, re-raises a cached load error,
+        and loads/caches an existing (possibly out-of-root) target on demand
+        so that ``show`` keeps its recursive behavior.
+        """
+        abspath = os.path.abspath(path)
+        if abspath in self.documents:
+            return self.documents[abspath]
+        if abspath in self.errors:
+            raise self.errors[abspath]
+        if not os.path.isfile(abspath):
+            return None
+        try:
+            doc = fcstd.FCStdDocument.read(abspath)
+        except fcstd.FCStdError as exc:
+            self.errors[abspath] = exc
+            raise
+        self._index(abspath, doc)
+        return doc
+
+    def referrers(self, path: str) -> set[str]:
+        """Absolute paths of successfully indexed documents linking to ``path``."""
+        return set(self._referrers.get(os.path.abspath(path), ()))
+
+
+def prepare_workspace(root: str,
+                      extra_paths: Iterable[str] = ()) -> Workspace:
+    """Scan ``root`` once and index every .FCStd archive it contains.
+
+    Requested existing ``extra_paths`` outside the root are included too.
+    Every candidate is loaded independently; a load failure is recorded on
+    the workspace and does not abort preparation. No filesystem access
+    happens here beyond the scan and the archive reads.
+    """
+    root = os.path.abspath(root)
+    ws = Workspace(root)
+    candidates = [os.path.abspath(p) for p in find_fcstd(root)]
+    for p in extra_paths:
+        abspath = os.path.abspath(p)
+        if abspath not in candidates and os.path.isfile(abspath):
+            candidates.append(abspath)
+    for abspath in candidates:
+        try:
+            doc = fcstd.FCStdDocument.read(abspath)
+        except fcstd.FCStdError as exc:
+            ws.errors[abspath] = exc
+        else:
+            ws._index(abspath, doc)
+    return ws
+
+
+def atomic_write(path: str, data: bytes) -> None:
+    """Atomically write opaque serialized archive bytes to ``path``."""
+    tmp = path + '.fc-assy.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 # ---------------------------------------------------------------- show
 
 def cmd_show(paths):
+    # Filter input paths (existence check: command I/O)
+    requested = []
     for p in paths:
-        if not p.endswith('.FCStd') or not os.path.isfile(p):  # input I/O
+        if not p.endswith('.FCStd') or not os.path.isfile(p):
             warn(f'{p}: not an existing .FCStd file, ignored')
             continue
-        show_tree(os.path.abspath(p), depth=0, seen=set())
+        requested.append(os.path.abspath(p))
+    ws = prepare_workspace(os.getcwd(), requested)
+    for abspath in requested:
+        show_tree(abspath, depth=0, seen=set(), ws=ws)
 
 
-def show_tree(abspath, depth, seen):
+def show_tree(abspath, depth, seen, ws):
     rel = os.path.relpath(abspath)
     indent = '  ' * depth
-    if not os.path.isfile(abspath):  # existence check (command-side I/O)
+    doc = ws.document(abspath)  # may raise FCStdError -> top-level diagnostic
+    if doc is None:
         print(f'{indent}{rel}  [MISSING]')
         return
-    # read from disk, then classify/reference-extract in memory
-    members = fcstd.read_fcstd(abspath)
-    xml = fcstd.document_xml(members)
-    kind = fcstd.classify(xml)
-    note = ''
-    if kind == 'combined':
-        note = '  (combined part+assy: NOT SUPPORTED by this tool)'
+    kind = doc.classify()
     if abspath in seen:
         print(f'{indent}{rel}  [{kind}] (already shown)')
         return
-    print(f'{indent}{rel}  [{kind}]{note}')
+    print(f'{indent}{rel}  [{kind}]')
     seen.add(abspath)
-    if kind in ('assy', 'combined'):
-        targets = [fcstd.resolve_ref(abspath, r) for r in fcstd.xlink_refs(xml)]
-        for t in sorted(targets):
-            show_tree(t, depth + 1, seen)
+    # traverse links directly; classification is a display hint only
+    for target in sorted(doc.links()):
+        show_tree(target, depth + 1, seen, ws)
 
 
 # ---------------------------------------------------------------- rshow
@@ -107,45 +199,29 @@ def cmd_rshow(paths, root):
             continue
         requested.append(os.path.abspath(p))
 
-    # Build a reverse XLink index: resolved absolute target -> set of
-    # absolute referring documents. Only referring docs inside the scan root
-    # participate; the requested file itself need not be under it.
-    referrers = {}
-    xml_cache = {}
-    for p in find_fcstd(root):  # scan/read: command I/O
-        abspath = os.path.abspath(p)
-        members = fcstd.read_fcstd(abspath)
-        xml_cache[abspath] = fcstd.document_xml(members)
-        for ref in fcstd.xlink_refs(xml_cache[abspath]):  # in-memory
-            target = fcstd.resolve_ref(abspath, ref)
-            referrers.setdefault(target, set()).add(abspath)
-
-    # Load valid requested files outside the scan root so they can still be
-    # classified (their XML is not part of the scan, so cache it separately).
-    for abspath in requested:
-        if abspath not in xml_cache:
-            xml_cache[abspath] = fcstd.document_xml(fcstd.read_fcstd(abspath))
+    # The reverse XLink index covers documents inside the scan root (plus
+    # the requested extras); the requested file itself need not be under it.
+    ws = prepare_workspace(root, requested)
 
     for abspath in requested:
-        rshow_tree(abspath, depth=0, seen=set(), referrers=referrers,
-                   xml_cache=xml_cache)
+        rshow_tree(abspath, depth=0, seen=set(), ws=ws)
 
 
-def rshow_tree(abspath, depth, seen, referrers, xml_cache):
+def rshow_tree(abspath, depth, seen, ws):
     rel = os.path.relpath(abspath)
     indent = '  ' * depth
-    xml = xml_cache[abspath]
-    kind = fcstd.classify(xml)
-    note = ''
-    if kind == 'combined':
-        note = '  (combined part+assy: NOT SUPPORTED by this tool)'
+    doc = ws.document(abspath)  # may raise FCStdError -> top-level diagnostic
+    if doc is None:
+        print(f'{indent}{rel}  [MISSING]')
+        return
+    kind = doc.classify()
     if abspath in seen:
         print(f'{indent}{rel}  [{kind}] (already shown)')
         return
-    print(f'{indent}{rel}  [{kind}]{note}')
+    print(f'{indent}{rel}  [{kind}]')
     seen.add(abspath)
-    for t in sorted(referrers.get(abspath, ())):
-        rshow_tree(t, depth + 1, seen, referrers, xml_cache)
+    for target in sorted(ws.referrers(abspath)):
+        rshow_tree(target, depth + 1, seen, ws)
 
 
 # ---------------------------------------------------------------- mv
@@ -212,101 +288,90 @@ def cmd_mv(srcs, dst, root):
         if os.path.exists(d) and d not in all_moves:  # existence check: cmd I/O
             fail(f'destination {os.path.relpath(d)} already exists')
 
-    # load every document once, cache XML and refs
-    docs = {}      # abs path -> members dict
-    xmls = {}      # abs path -> Document.xml text
-    refs = {}      # abs path -> list[str] xlink refs
-    for p in find_fcstd(root):  # scan/read: command I/O
-        abspath = os.path.abspath(p)
-        members = fcstd.read_fcstd(abspath)
-        docs[abspath] = members
-        xmls[abspath] = fcstd.document_xml(members)
-        refs[abspath] = fcstd.xlink_refs(xmls[abspath])
+    ws = prepare_workspace(root)
 
-    final_path = {p: moves.get(p, p) for p in docs}
+    # -- Phase 2: in-memory plan / validation (no filesystem changes)
+    # Access every moved FCStd source, surfacing its stored load error;
+    # then add every successfully indexed referrer of a moved FCStd path.
+    # Unrelated flagged archives are never accessed here.
+    affected = {}  # abs path -> FCStdDocument (moved sources + referrers)
+    for src in sorted(moves):
+        doc = ws.document(src)  # re-raises a cached FCStdError, if any
+        if doc is None:
+            fail(f'{os.path.relpath(src)}: no such file or directory')
+        affected[src] = doc
+    for src in sorted(moves):
+        for referrer in sorted(ws.referrers(src)):
+            if referrer not in affected:
+                affected[referrer] = ws.document(referrer)
+    final_path = {p: moves.get(p, p) for p in affected}
 
-    # Perform every pre-move existence check for resolved link targets once,
-    # retaining the results so later phases make no isfile calls.
-    target_exists = {}  # abs resolved target -> bool
-    for p in docs:
-        for r in refs[p]:
-            target = fcstd.resolve_ref(p, r)
-            target_exists.setdefault(target, os.path.isfile(target))
+    # CLI policy before mutation: every link in an affected document must
+    # resolve to an existing file (relink/serialize never check this).
+    for p in sorted(affected):
+        for target in affected[p].links():
+            if not os.path.isfile(target):  # existence check: command policy
+                fail(f'{os.path.relpath(p)}: pre-existing broken XLink to '
+                     f'{os.path.relpath(target)}; fix that first')
 
-    # -- Phase 2: in-memory plan / validation (no filesystem access)
-    # refuse unsupported document structures among involved docs
-    involved = set(moves)
-    for p in docs:
-        if any(fcstd.resolve_ref(p, r) in moves for r in refs[p]):
-            involved.add(p)
-    for p in involved:
-        kind = fcstd.classify(xmls[p])
-        if kind not in ('part', 'assy'):
-            fail(f'{os.path.relpath(p)}: classified as {kind!r}; '
-                 f'refusing to touch it')
-
-    # compute rewritten Document.xml for every doc (in memory)
-    changed = {}  # abs old path -> new members dict
-    for p, members in docs.items():
-        new_dir = os.path.dirname(final_path[p])
-
-        def make_rewrite_ref(doc):
-            def rewrite_ref(old):
-                target = fcstd.resolve_ref(doc, old)
-                if not target_exists[target]:
-                    fail(f'{os.path.relpath(doc)}: pre-existing broken XLink '
-                         f'to {old!r}; fix that first')
-                new_rel = os.path.relpath(final_path.get(target, target),
-                                          new_dir)
-                return new_rel.replace(os.sep, '/')
-            return rewrite_ref
-
-        new_xml = fcstd.rewrite_xlinks(xmls[p], make_rewrite_ref(p))
-        if new_xml != xmls[p]:
-            changed[p] = {**members, 'Document.xml': new_xml.encode('utf-8')}
-
-    # paranoia scan of the FINAL state for every scanned document
-    for p, members in docs.items():
-        final_members = changed.get(p, members)
-        try:
-            has_saved_error = fcstd.validate_supported_references(final_members)
-        except fcstd.FCStdError as exc:
-            fail(f'{os.path.relpath(p)}: {exc}')
-        if has_saved_error:
+    # informational stale-recompute-error warning, affected documents only
+    for p in sorted(affected):
+        if affected[p].has_saved_path_error:
             warn(f'{os.path.relpath(p)}: has saved recompute errors '
                  f'mentioning .FCStd (stale "Link broken!" messages?); '
                  f'left as-is, recompute and save in FreeCAD to clear')
 
-    # final in-memory resolution check against the simulated final layout
-    final_files = set(final_path.values()) | set(plain_moves.values())
-    for p, members in docs.items():
-        final_members = changed.get(p, members)
-        xml = fcstd.document_xml(final_members)
-        for ref in fcstd.xlink_refs(xml):
-            target = fcstd.resolve_ref(final_path[p], ref)
-            existing_unmoved = target not in all_moves and target_exists.get(target, False)
-            if target not in final_files and not existing_unmoved:
-                fail(f'{os.path.relpath(final_path[p])}: link {ref!r} would '
-                     f'not resolve after the move')
+    # rewrite every internal occurrence of each moved FCStd path; successful
+    # load is the sole schema-safety gate (combined/unknown are not refused)
+    for p in sorted(affected):
+        for src, d in sorted(moves.items()):
+            affected[p].relink(src, d)
+
+    # serialize every affected document against its FINAL location; moving a
+    # document rebases its serialized relative outgoing paths even when their
+    # absolute targets did not move
+    serialized = {}  # abs pre-move path -> opaque complete archive bytes
+    for p in sorted(affected):
+        try:
+            serialized[p] = affected[p].serialize(final_path[p])
+        except fcstd.FCStdError as exc:
+            fail(f'{os.path.relpath(final_path[p])}: {exc}')
+
+    # validate links of affected documents against the simulated final layout
+    final_files = set(all_moves.values())
+    for p in sorted(affected):
+        for target in affected[p].links():
+            final_target = all_moves.get(target, target)
+            if final_target not in final_files and not os.path.isfile(final_target):
+                fail(f'{os.path.relpath(final_path[p])}: link to '
+                     f'{os.path.relpath(target)} would not resolve after '
+                     f'the move')
 
     # -- Phase 3: filesystem commit / verification
-    for src, d in sorted(all_moves.items()):
+    for d in all_moves.values():
         os.makedirs(os.path.dirname(d), exist_ok=True)
 
-    n_rewritten = 0
-    for p, members in changed.items():
-        fcstd.write_fcstd(p, members)  # rewrite in place first (src still exists)
-        n_rewritten += 1
-
-    # two-phase move so overlapping src/dst sets (e.g. b->c with a->b) never
-    # clobber
-    staged = {}
+    # two-phase staging so overlapping src/dst sets (e.g. b->c with a->b)
+    # never clobber each other
+    stage_of = {}
     for i, (src, d) in enumerate(sorted(all_moves.items())):
         tmp = os.path.join(os.path.dirname(src), f'.fc-assy.stage.{i}')
         os.replace(src, tmp)
-        staged[tmp] = d
-    for tmp, d in staged.items():
-        os.replace(tmp, d)
+        stage_of[src] = tmp
+
+    # moved FCStd files: atomically write the precomputed serialized bytes
+    # directly to their destination, then drop the staged original
+    for src in sorted(moves):
+        atomic_write(moves[src], serialized[src])
+        os.remove(stage_of[src])
+    # plain (non-FCStd) files move normally
+    for src in sorted(plain_moves):
+        os.replace(stage_of[src], plain_moves[src])
+    # affected referrers that did not move are atomically replaced
+    for p in sorted(affected):
+        if p not in moves:
+            atomic_write(p, serialized[p])
+
     for src in sorted(all_moves, reverse=True):  # prune emptied dirs
         sd = os.path.dirname(src)
         while sd != root:
@@ -316,17 +381,24 @@ def cmd_mv(srcs, dst, root):
                 break
             sd = os.path.dirname(sd)
 
-    # verify from disk: reread the resulting tree and check links
-    for p in find_fcstd(root):
-        members = fcstd.read_fcstd(p)
-        for ref in fcstd.xlink_refs(fcstd.document_xml(members)):
-            target = fcstd.resolve_ref(os.path.abspath(p), ref)
+    # verify from disk: reload only the affected documents at their final
+    # paths and check their links. Unrelated flagged archives and unrelated
+    # pre-existing broken links are never looked at here.
+    for p in sorted(affected):
+        final = final_path[p]
+        try:
+            doc = fcstd.FCStdDocument.read(final)
+        except fcstd.FCStdError as exc:
+            fail(f'POST-CHECK FAILED: {final}: could not reload ({exc}). '
+                 f'Restore from version control and report this.')
+        for target in doc.links():
             if not os.path.isfile(target):
-                fail(f'POST-CHECK FAILED: {p}: {ref!r} does not resolve. '
-                     f'Restore from version control and report this.')
+                fail(f'POST-CHECK FAILED: {final}: link to {target!r} does '
+                     f'not resolve. Restore from version control and '
+                     f'report this.')
 
     print(f'moved {len(all_moves)} file(s), '
-          f'rewrote links in {n_rewritten} document(s); all links verified')
+          f'rewrote links in {len(serialized)} document(s); all links verified')
 
 
 def main():

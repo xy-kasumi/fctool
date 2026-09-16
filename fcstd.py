@@ -1,88 +1,79 @@
-"""Pure FreeCAD .FCStd archive/XML knowledge, isolated from the CLI.
+"""Read, inspect, relink, and serialize FreeCAD .FCStd documents."""
 
-An .FCStd file is a ZIP archive whose FreeCAD document tree lives in a
-`Document.xml` member. Cross-document references appear as `file="..."`
-attributes inside `<XLink*>` tags; those values are slash-separated paths
-relative to the referring document's directory.
+from __future__ import annotations
 
-This module is split into two explicitly labelled sections:
-
-* **In-memory (no filesystem access)** helpers operate only on strings,
-  member mappings (`dict[str, bytes]`), or path strings. They never touch
-  the filesystem, never print, and never call `sys.exit`.
-* **Filesystem boundary** helpers are the *only* functions here that can
-  read from or write to disk. All I/O is confined to these functions.
-
-All FCStd-member content is held in memory as `dict[str, bytes]`; nothing
-here lazily reopens a source archive after reading it.
-"""
-
+import io
 import os
 import posixpath
 import re
 import zipfile
+from typing import Literal
 
-XLINK_TAG_RE = re.compile(r'<XLink\w*\b[^>]*>')
-FILE_ATTR_RE = re.compile(r'file="([^"]*)"')
+DocumentKind = Literal['part', 'assy', 'combined', 'unknown']
+
+XLINK_TAG_RE: re.Pattern[str] = re.compile(r'<XLink\w*\b[^>]*>')
+FILE_ATTR_RE: re.Pattern[str] = re.compile(r'file="([^"]*)"')
 # FreeCAD saves the last recompute error message verbatim on the object tag
 # (e.g. "Link broken! ... File: ../x.FCStd"). Informational only; FreeCAD
 # regenerates it on recompute, so it is neither a reference nor rewritten.
-OBJ_ERROR_ATTR_RE = re.compile(r'(?<=<Object )([^>]*?)Error="[^"]*"')
-OBJ_TYPE_RE = re.compile(r'<Object type="([^"]+)"')
-GEOM_PREFIXES = ('PartDesign::', 'Part::', 'Sketcher::', 'Mesh::')
-ASSY_PREFIXES = ('Assembly::',)
-ASSY_TYPES = ('App::Link',)
+OBJ_ERROR_ATTR_RE: re.Pattern[str] = re.compile(
+    r'(?<=<Object )([^>]*?)Error="[^"]*"')
+OBJ_TYPE_RE: re.Pattern[str] = re.compile(r'<Object type="([^"]+)"')
+# Legal XML entities (the five predefined names plus numeric character
+# references). A bare "&" anywhere else in an attribute value is not
+# well-formed XML and is rejected at load time.
+ENTITY_RE: re.Pattern[str] = re.compile(
+    r'&(amp|lt|gt|quot|apos|#\d+|#x[0-9A-Fa-f]+);')
+BARE_AMP_RE: re.Pattern[str] = re.compile(
+    r'&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9A-Fa-f]+);)')
+GEOM_PREFIXES: tuple[str, ...] = ('PartDesign::', 'Part::', 'Sketcher::',
+                                  'Mesh::')
+ASSY_PREFIXES: tuple[str, ...] = ('Assembly::',)
+ASSY_TYPES: tuple[str, ...] = ('App::Link',)
+_ENTITY_NAMES: dict[str, str] = {'amp': '&', 'lt': '<', 'gt': '>',
+                                 'quot': '"', 'apos': "'"}
 
 
 class FCStdError(Exception):
-    """Unsupported or malformed FCStd content.
-
-    Raised by the pure helpers here to report a condition the CLI cannot
-    safely handle. The CLI translates these into the existing diagnostic
-    wording; this module itself never prints or exits.
-    """
+    """Raised when an FCStd document cannot be loaded or serialized."""
 
 
 # ----------------------------------------------------------------
-# In-memory (no filesystem access)
+# In-memory (no filesystem access) private helpers
 
 
-def document_xml(members):
-    """Return the UTF-8 text of the ``Document.xml`` member (no I/O)."""
-    return members['Document.xml'].decode('utf-8')
+def _unescape_entities(ref: str) -> str:
+    """Decode legal XML entities in an XLink attribute value. No I/O."""
+
+    def repl(m: re.Match[str]) -> str:
+        name: str = m.group(1)
+        if name.startswith('#x') or name.startswith('#X'):
+            return chr(int(name[2:], 16))
+        if name.startswith('#'):
+            return chr(int(name[1:]))
+        return _ENTITY_NAMES[name]
+
+    return ENTITY_RE.sub(repl, ref)
 
 
-def xlink_refs(xml):
-    """Return unique nonempty ``file="..."`` values inside ``<XLink*>`` tags.
-
-    Order is first-seen and preserved. XML-escaped paths (values containing
-    ``&``, ``<`` or ``>``) are rejected with :class:`FCStdError` because they
-    cannot be safely rewritten. No I/O.
-    """
-    refs = []
-    for tag in XLINK_TAG_RE.findall(xml):
-        for val in FILE_ATTR_RE.findall(tag):
-            if val and val not in refs:
-                if re.search(r'[&<>]', val):
-                    raise FCStdError(
-                        f'XLink path {val!r} contains XML-escaped characters; '
-                        f'unsupported, update this tool')
-                refs.append(val)
-    return refs
+def _escape_entities(ref: str) -> str:
+    """Encode a path for a double-quoted XML attribute (incl. quotes). No I/O."""
+    return (ref.replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;'))
 
 
-def classify(xml):
+def _classify(xml: str, has_links: bool) -> DocumentKind:
     """Classify a document as ``part``/``assy``/``combined``/``unknown``.
 
     Preserves the original rules: a document with both geometry and assembly
     content is ``combined``; assembly-only is ``assy``; geometry-only is
     ``part``; otherwise ``unknown``. No I/O.
     """
-    types = set(OBJ_TYPE_RE.findall(xml))
+    types: set[str] = set(OBJ_TYPE_RE.findall(xml))
     has_geom = any(t.startswith(GEOM_PREFIXES) for t in types)
     has_assy = (any(t.startswith(ASSY_PREFIXES) for t in types)
                 or any(t in ASSY_TYPES for t in types)
-                or bool(xlink_refs(xml)))
+                or has_links)
     if has_geom and has_assy:
         return 'combined'
     if has_assy:
@@ -92,104 +83,179 @@ def classify(xml):
     return 'unknown'
 
 
-def resolve_ref(doc_path, ref):
-    """Resolve an XLink ``file=`` path against its referring document.
+def _blank_xlink_files(m: re.Match[str]) -> str:
+    """Replace nonempty ``file=`` values inside one XLink tag with empty ones."""
 
-    XLink paths are relative to the referring document's directory. Absolute
-    and drive-letter paths are rejected. This is path arithmetic only -- no
-    existence check. No I/O.
-    """
-    if posixpath.isabs(ref) or (len(ref) > 1 and ref[1] == ':'):
-        raise FCStdError(
-            f'{doc_path}: absolute XLink path {ref!r}; unsupported')
-    return os.path.normpath(os.path.join(os.path.dirname(doc_path), ref))
+    def blank(fm: re.Match[str]) -> str:
+        if fm.group(1):
+            return 'file=""'
+        return fm.group(0)
 
-
-def rewrite_xlinks(xml, rewrite_ref):
-    """Apply ``rewrite_ref`` to each nonempty ``file=`` attribute.
-
-    ``rewrite_ref`` receives the current attribute value and must return the
-    replacement value. It is applied only to nonempty ``file`` attributes
-    inside ``<XLink*>`` tags; all other XML text is preserved verbatim.
-    Replacement values requiring XML escaping (``&``, ``<``, ``>`` or ``"``)
-    are rejected with :class:`FCStdError`. No I/O.
-    """
-
-    def _fix_file(fm):
-        old = fm.group(1)
-        if not old:
-            return fm.group(0)
-        new = rewrite_ref(old)
-        if re.search(r'[&<>"]', new):
-            raise FCStdError(f'new path {new!r} needs XML escaping; unsupported')
-        return f'file="{new}"'
-
-    def _fix_tag(m):
-        return FILE_ATTR_RE.sub(_fix_file, m.group(0))
-
-    return XLINK_TAG_RE.sub(_fix_tag, xml)
-
-
-def validate_supported_references(members):
-    """Scan a member mapping for ``.FCStd`` byte sequences we don't understand.
-
-    Within ``Document.xml``, any remaining ``.FCStd`` mention outside XLink
-    ``file`` attributes (and outside saved recompute-``Error`` attributes,
-    which are informational and left untouched) raises :class:`FCStdError`.
-    A ``.FCStd`` mention in any other ZIP member likewise raises.
-
-    Returns ``True`` when a saved Object ``Error`` attribute mentions
-    ``.FCStd`` (so the caller can emit its existing warning) and ``False``
-    otherwise. No I/O.
-    """
-    has_saved_error = False
-    for name, data in members.items():
-        if name == 'Document.xml':
-            xml = data.decode('utf-8')
-            stripped = XLINK_TAG_RE.sub(
-                lambda m: FILE_ATTR_RE.sub('file=""', m.group(0)), xml)
-            errors = [m.group(0) for m in OBJ_ERROR_ATTR_RE.finditer(stripped)]
-            if any('.FCStd' in e for e in errors):
-                has_saved_error = True
-            stripped = OBJ_ERROR_ATTR_RE.sub(r'\1Error=""', stripped)
-            if '.FCStd' in stripped:
-                raise FCStdError(
-                    f'Document.xml mentions .FCStd outside XLink file '
-                    f'attributes; update this tool')
-        elif b'.FCStd' in data:
-            raise FCStdError(
-                f'zip member {name!r} contains ".FCStd"; unknown schema '
-                f'usage, update this tool')
-    return has_saved_error
+    return FILE_ATTR_RE.sub(blank, m.group(0))
 
 
 # ----------------------------------------------------------------
-# Filesystem boundary
+# Document model
 
 
-def read_fcstd(path):
-    """Read all ZIP members of ``path`` into ``{name: bytes}``.
+class FCStdDocument:
+    """An in-memory .FCStd document. Create instances with read()."""
 
-    Rejects an archive lacking ``Document.xml``, retaining the path in the
-    error. This is the only function that opens archives for reading.
-    """
-    with zipfile.ZipFile(path) as z:
-        names = z.namelist()
-        if 'Document.xml' not in names:
-            raise FCStdError(f'{path}: no Document.xml inside; '
-                             f'not a FreeCAD document?')
-        return {n: z.read(n) for n in names}
+    def __init__(self, source_path: str, members: dict[str, bytes], xml: str,
+                 link_targets: list[str], kind: DocumentKind,
+                 has_saved_error: bool) -> None:
+        self._source_path = source_path
+        self._members = members
+        self._xml = xml
+        # one normalized absolute target per nonempty XLink file attribute,
+        # in document order (duplicates preserved)
+        self._link_targets = link_targets
+        self._kind = kind
+        self._has_saved_error = has_saved_error
 
+    @classmethod
+    def read(cls, path: str) -> FCStdDocument:
+        """Load and validate a document.
 
-def write_fcstd(path, members):
-    """Write ``members`` to ``path`` atomically.
+        Relative links are resolved from the document's absolute parent
+        directory.
 
-    Writes to ``path + '.fc-assy.tmp'`` with deflated compression and then
-    ``os.replace``-s into place. Member contents and order are preserved.
-    This is the only function that writes archives.
-    """
-    tmp = path + '.fc-assy.tmp'
-    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
+        Raises:
+            FCStdError: If the archive cannot be read or contains unsupported
+                or malformed content.
+        """
+        abspath = os.path.abspath(path)
+        try:
+            with zipfile.ZipFile(abspath) as z:
+                names = z.namelist()
+                if 'Document.xml' not in names:
+                    raise FCStdError(f'{abspath}: no Document.xml inside; '
+                                    f'not a FreeCAD document?')
+                members = {name: z.read(name) for name in names}
+        except (zipfile.BadZipFile, OSError, ValueError, NotImplementedError,
+                RuntimeError) as exc:
+            raise FCStdError(f'{abspath}: cannot read archive ({exc})') from exc
+
+        try:
+            xml = members['Document.xml'].decode('utf-8')
+        except UnicodeDecodeError as exc:
+            raise FCStdError(f'{abspath}: Document.xml is not valid UTF-8') \
+                from exc
+
+        # Conservative .FCStd scan: mentions are allowed only inside XLink
+        # file attributes and saved <Object Error> attributes. Mentions in
+        # saved Error attributes only set has_saved_path_error.
+        stripped = XLINK_TAG_RE.sub(_blank_xlink_files, xml)
+        has_saved_error = any('.FCStd' in m.group(0)
+                              for m in OBJ_ERROR_ATTR_RE.finditer(stripped))
+        stripped = OBJ_ERROR_ATTR_RE.sub(r'\1Error=""', stripped)
+        if '.FCStd' in stripped:
+            raise FCStdError(f'{abspath}: Document.xml mentions .FCStd '
+                            f'outside XLink file attributes; update this tool')
         for name, data in members.items():
-            z.writestr(name, data)
-    os.replace(tmp, path)
+            if name != 'Document.xml' and b'.FCStd' in data:
+                raise FCStdError(f'{abspath}: zip member {name!r} contains '
+                                f'".FCStd"; unknown schema usage, update '
+                                f'this tool')
+
+        doc_dir = os.path.dirname(abspath)
+        link_targets: list[str] = []
+        for tag in XLINK_TAG_RE.findall(xml):
+            for raw in FILE_ATTR_RE.findall(tag):
+                if not raw:
+                    continue
+                if BARE_AMP_RE.search(raw):
+                    raise FCStdError(f'{abspath}: XLink path {raw!r} contains '
+                                    f'an invalid XML entity; not well-formed '
+                                    f'XML')
+                ref = _unescape_entities(raw)
+                if posixpath.isabs(ref) or (len(ref) > 1 and ref[1] == ':'):
+                    raise FCStdError(f'{abspath}: absolute XLink path '
+                                    f'{ref!r}; unsupported')
+                link_targets.append(
+                    os.path.normpath(os.path.join(doc_dir, ref)))
+
+        return cls(abspath, members, xml, link_targets,
+                   _classify(xml, bool(link_targets)), has_saved_error)
+
+    def links(self) -> list[str]:
+        """Return unique absolute link targets in first-occurrence order."""
+        out: list[str] = []
+        for target in self._link_targets:
+            if target not in out:
+                out.append(target)
+        return out
+
+    def relink(self, old: str, new: str) -> None:
+        """Replace every matching link.
+
+        Paths are normalized and made absolute, but are not checked for
+        existence. No match is a no-op.
+        """
+        old_norm = os.path.normpath(os.path.abspath(old))
+        new_norm = os.path.normpath(os.path.abspath(new))
+        self._link_targets = [new_norm if t == old_norm else t
+                              for t in self._link_targets]
+
+    def classify(self) -> DocumentKind:
+        """Return a heuristic classification intended as a display hint."""
+        return self._kind
+
+    @property
+    def has_saved_path_error(self) -> bool:
+        """Whether a saved FreeCAD object error mentions an FCStd path.
+
+        Such recompute messages may be stale and are informational only.
+        """
+        return self._has_saved_error
+
+    def serialize(self, path: str) -> bytes:
+        """Serialize for the document's logical destination.
+
+        Links are stored relative to the destination's directory. Unmodified
+        XML and archive members are preserved.
+
+        Raises:
+            FCStdError: If a link cannot be made relative to the destination
+                or the archive cannot be created.
+        """
+        abspath = os.path.abspath(path)
+        doc_dir = os.path.dirname(abspath)
+        rel_values: list[str] = []
+        for target in self._link_targets:
+            try:
+                rel = os.path.relpath(target, doc_dir)
+            except ValueError as exc:
+                raise FCStdError(
+                    f'{abspath}: cannot express link target {target!r} '
+                    f'relative to {doc_dir!r} ({exc})') from exc
+            rel_values.append(_escape_entities(rel.replace(os.sep, '/')))
+
+        pending = iter(rel_values)
+
+        def fix_file(fm: re.Match[str]) -> str:
+            if not fm.group(1):
+                return fm.group(0)
+            try:
+                new_value = next(pending)
+            except StopIteration:
+                raise FCStdError(f'{abspath}: internal error: XLink file '
+                                f'occurrences changed since read') from None
+            return f'file="{new_value}"'
+
+        def fix_tag(m: re.Match[str]) -> str:
+            return FILE_ATTR_RE.sub(fix_file, m.group(0))
+
+        new_xml = XLINK_TAG_RE.sub(fix_tag, self._xml)
+
+        buf = io.BytesIO()
+        try:
+            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+                for name, data in self._members.items():
+                    if name == 'Document.xml':
+                        data = new_xml.encode('utf-8')
+                    z.writestr(name, data)
+        except (OSError, ValueError) as exc:
+            raise FCStdError(f'{abspath}: cannot serialize document ({exc})') \
+                from exc
+        return buf.getvalue()
