@@ -3,6 +3,10 @@
 
 Commands:
   fc-assy.py show <paths...>          classify files and list assembly deps
+  fc-assy.py rshow [--root DIR] <paths...>
+                                      classify files and list reverse assembly
+                                      deps in the tree rooted at cwd
+                                      (override with --root)
   fc-assy.py mv <srcs...> <dst>       move/rename files, updating all XLink
                                       references in the tree rooted at cwd
                                       (override with --root)
@@ -122,6 +126,62 @@ def cmd_show(paths):
             warn(f'{p}: not an existing .FCStd file, ignored')
             continue
         show_tree(os.path.abspath(p), depth=0, seen=set())
+
+
+# ---------------------------------------------------------------- rshow
+
+def cmd_rshow(paths, root):
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        fail(f'--root {root}: not a directory')
+
+    # Filter input paths exactly like cmd_show.
+    requested = []
+    for p in paths:
+        if not p.endswith('.FCStd') or not os.path.isfile(p):
+            warn(f'{p}: not an existing .FCStd file, ignored')
+            continue
+        requested.append(os.path.abspath(p))
+
+    # Build a reverse XLink index: resolved absolute target -> set of
+    # absolute referring documents. Only referring docs inside the scan root
+    # participate; the requested file itself need not be under it.
+    referrers = {}
+    xml_cache = {}
+    for p in find_fcstd(root):
+        abspath = os.path.abspath(p)
+        members = load_doc(abspath)
+        xml_cache[abspath] = doc_xml(members)
+        for ref in xlink_refs(xml_cache[abspath]):
+            target = resolve_ref(abspath, ref)
+            referrers.setdefault(target, set()).add(abspath)
+
+    # Load valid requested files outside the scan root so they can still be
+    # classified (their XML is not part of the scan, so cache it separately).
+    for abspath in requested:
+        if abspath not in xml_cache:
+            xml_cache[abspath] = doc_xml(load_doc(abspath))
+
+    for abspath in requested:
+        rshow_tree(abspath, depth=0, seen=set(), referrers=referrers,
+                   xml_cache=xml_cache)
+
+
+def rshow_tree(abspath, depth, seen, referrers, xml_cache):
+    rel = os.path.relpath(abspath)
+    indent = '  ' * depth
+    xml = xml_cache[abspath]
+    kind = classify(xml)
+    note = ''
+    if kind == 'combined':
+        note = '  (combined part+assy: NOT SUPPORTED by this tool)'
+    if abspath in seen:
+        print(f'{indent}{rel}  [{kind}] (already shown)')
+        return
+    print(f'{indent}{rel}  [{kind}]{note}')
+    seen.add(abspath)
+    for t in sorted(referrers.get(abspath, ())):
+        rshow_tree(t, depth + 1, seen, referrers, xml_cache)
 
 
 def show_tree(abspath, depth, seen):
@@ -341,6 +401,12 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
     ps = sub.add_parser('show', help='classify files and list assembly deps')
     ps.add_argument('paths', nargs='+')
+    pr = sub.add_parser('rshow',
+                        help='classify files and list reverse assembly deps')
+    pr.add_argument('--root', default='.',
+                    help='tree scanned for referring documents; references '
+                         'from outside it are not shown (default: cwd)')
+    pr.add_argument('paths', nargs='+')
     pm = sub.add_parser('mv', help='move/rename files, updating references')
     pm.add_argument('--root', default='.',
                     help='tree to scan for referring documents and to keep '
@@ -350,6 +416,8 @@ def main():
     args = ap.parse_args()
     if args.cmd == 'show':
         cmd_show(args.paths)
+    elif args.cmd == 'rshow':
+        cmd_rshow(args.paths, args.root)
     else:
         if len(args.paths) < 2:
             fail('mv needs at least one source and a destination')
