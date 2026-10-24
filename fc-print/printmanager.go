@@ -60,10 +60,49 @@ type PrintManager struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// statsMu guards the stat* counters below; the body/file counters are
+	// refreshed by the run goroutine, the total-file walk runs lazily in
+	// Stats on any goroutine.
+	statsMu        sync.Mutex
+	statBodies     int
+	statTaggedFiles int
+	statTotalFiles int
+	totalCountedAt time.Time
+
 	// run-goroutine state.
 	cache      map[string]map[string]bodyState // input path -> body name -> state
 	claims     map[string]string               // output path -> claim key
 	fileHashes map[string]string               // input path -> content hash
+}
+
+// Stats reports the header counters: the number of currently tracked
+// bodies, the number of source FCStd files containing valid tags, and the
+// total number of FCStd files under the watch root. The total is
+// re-counted lazily at most once per watch poll interval; a failed walk
+// keeps the previous value.
+func (m *PrintManager) Stats() (bodies, tagged, total int) {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	if time.Since(m.totalCountedAt) >= m.watchOptions.PollInterval {
+		if count, err := countSuffixFiles(m.root, m.watchOptions.FileSuffix); err == nil {
+			m.statTotalFiles = count
+		}
+		m.totalCountedAt = time.Now()
+	}
+	return m.statBodies, m.statTaggedFiles, m.statTotalFiles
+}
+
+// refreshBodyStats recomputes the body and tagged-file counters from the
+// cache. Called on the run goroutine after every cache mutation.
+func (m *PrintManager) refreshBodyStats() {
+	bodies := 0
+	for _, fileBodies := range m.cache {
+		bodies += len(fileBodies)
+	}
+	m.statsMu.Lock()
+	m.statBodies = bodies
+	m.statTaggedFiles = len(m.cache)
+	m.statsMu.Unlock()
 }
 
 func claimKey(input, name string) string {
@@ -384,6 +423,7 @@ func (m *PrintManager) mergeFile(
 	} else {
 		m.cache[input] = prev
 	}
+	m.refreshBodyStats()
 	return victims, true
 }
 
@@ -468,6 +508,7 @@ func (m *PrintManager) deleteFileBodies(ctx context.Context, input string) bool 
 		_ = os.Remove(state.output)
 	}
 	delete(m.cache, input)
+	m.refreshBodyStats()
 	return true
 }
 

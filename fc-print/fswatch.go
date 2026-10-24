@@ -129,6 +129,40 @@ func scanTree(root, suffix string, limit int, enforceLimit bool) (map[string]str
 	return snapshot, entries, nil
 }
 
+// countSuffixFiles counts the files under root (recursive, no symlink
+// following) whose name matches suffix. Unlike scanTree it hashes nothing,
+// so it is cheap enough to run for status displays.
+func countSuffixFiles(root, suffix string) (int, error) {
+	count := 0
+	dirs := []string{root}
+	for len(dirs) > 0 {
+		dir := dirs[len(dirs)-1]
+		dirs = dirs[:len(dirs)-1]
+		handle, err := os.Open(dir)
+		if err != nil {
+			return count, err
+		}
+		list, err := handle.ReadDir(-1)
+		handle.Close()
+		if err != nil {
+			return count, err
+		}
+		for _, entry := range list {
+			if entry.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if entry.IsDir() {
+				dirs = append(dirs, filepath.Join(dir, entry.Name()))
+				continue
+			}
+			if matchesSuffix(entry.Name(), suffix) {
+				count++
+			}
+		}
+	}
+	return count, nil
+}
+
 // scanWithRetry retries scans that raced with concurrent directory removal,
 // then gives up with a surfaced error rather than risking missed events.
 func scanWithRetry(root, suffix string, limit int, enforceLimit bool) (map[string]string, int, error) {

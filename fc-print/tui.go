@@ -54,7 +54,7 @@ func RunTUI(
 	status := ""
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	draw(entries, status)
+	draw(manager, entries, status)
 	for {
 		select {
 		case <-ctx.Done():
@@ -67,13 +67,13 @@ func RunTUI(
 			if len(entries) > 1000 {
 				entries = entries[:1000]
 			}
-			draw(entries, status)
+			draw(manager, entries, status)
 		case err, ok := <-errs:
 			if !ok {
 				return nil
 			}
 			status = err.Error()
-			draw(entries, status)
+			draw(manager, entries, status)
 		case key, ok := <-keys:
 			if !ok {
 				return nil
@@ -82,12 +82,12 @@ func RunTUI(
 			case 'c', 'C':
 				entries = nil
 				status = ""
-				draw(entries, status)
+				draw(manager, entries, status)
 			case 'q', 'Q', 0x03: // q or Ctrl-C
 				return nil
 			}
 		case <-ticker.C:
-			draw(entries, status)
+			draw(manager, entries, status)
 		}
 	}
 }
@@ -115,7 +115,7 @@ func runPlainOutput(ctx context.Context, events <-chan BodyEvent, errs <-chan er
 	}
 }
 
-func draw(entries []BodyEvent, status string) {
+func draw(manager *PrintManager, entries []BodyEvent, status string) {
 	width, height := termSize()
 	var out strings.Builder
 	out.WriteString("\x1b[H\x1b[0J") // home, clear below
@@ -127,7 +127,9 @@ func draw(entries []BodyEvent, status string) {
 		out.WriteString(string(text))
 		out.WriteString("\x1b[K\r\n")
 	}
-	line("fc-print  (c: clear  q: quit)")
+	bodies, tagged, total := manager.Stats()
+	line("fc-print  bodies: %d | FCStd: %d (%d)  (c: clear  q: quit)",
+		bodies, tagged, total)
 	line("%s", strings.Repeat("-", minInt(width, 72)))
 	max := height - 4
 	if max > 0 && len(entries) > max {
