@@ -63,11 +63,16 @@ type PrintManager struct {
 	// statsMu guards the stat* counters below; the body/file counters are
 	// refreshed by the run goroutine, the total-file walk runs lazily in
 	// Stats on any goroutine.
-	statsMu        sync.Mutex
-	statBodies     int
+	statsMu         sync.Mutex
+	statBodies      int
 	statTaggedFiles int
-	statTotalFiles int
-	totalCountedAt time.Time
+	statTotalFiles  int
+	totalCountedAt  time.Time
+
+	// busyMu guards the in-flight FreeCAD batch state below.
+	busyMu    sync.Mutex
+	busyFiles int
+	busySince time.Time
 
 	// run-goroutine state.
 	cache      map[string]map[string]bodyState // input path -> body name -> state
@@ -103,6 +108,26 @@ func (m *PrintManager) refreshBodyStats() {
 	m.statBodies = bodies
 	m.statTaggedFiles = len(m.cache)
 	m.statsMu.Unlock()
+}
+
+// Processing reports the current FreeCAD batch: the number of source
+// files being processed and when the batch started. files is 0 when
+// no FreeCAD child process is running.
+func (m *PrintManager) Processing() (files int, since time.Time) {
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	return m.busyFiles, m.busySince
+}
+
+// setBusy records that a FreeCAD batch over count files started
+// (count > 0) or finished (count == 0).
+func (m *PrintManager) setBusy(count int) {
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	m.busyFiles = count
+	if count > 0 {
+		m.busySince = time.Now()
+	}
 }
 
 func claimKey(input, name string) string {
@@ -288,10 +313,12 @@ func (m *PrintManager) extractRound(
 		if len(paths) == 0 {
 			return nil, true
 		}
+		m.setBusy(len(paths))
 		result, err := ExtractBodies(ctx, m.freeCAD, ExtractBodiesRequest{
 			SourcePaths: paths,
 			OutputDir:   m.exportRoot,
 		})
+		m.setBusy(0)
 		if ctx.Err() != nil {
 			return nil, false
 		}
@@ -314,14 +341,22 @@ func (m *PrintManager) extractRound(
 			}
 			byInput[body.InputPath] = append(byInput[body.InputPath], body)
 		}
+		// Record the content hash of every input processed this round, even
+		// ones that yielded no bodies (or failed per-file): handleBatch
+		// suppresses re-extraction by hash, and without this, files without
+		// Mfg.print bodies would be re-extracted whenever a watcher batch
+		// mentions them — notably the watcher's first full-tree diff right
+		// after the initial pass.
+		for _, input := range paths {
+			if hash, exists := hashes[input]; exists {
+				m.fileHashes[input] = hash
+			}
+		}
 		requeue := map[string]bool{}
 		for _, input := range sortedBodyInputs(byInput) {
 			victims, ok := m.mergeFile(ctx, input, byInput[input])
 			if !ok {
 				return nil, false
-			}
-			if hash, exists := hashes[input]; exists {
-				m.fileHashes[input] = hash
 			}
 			for victim := range victims {
 				requeue[victim] = true

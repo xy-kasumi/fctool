@@ -23,11 +23,11 @@ func RunTUI(
 	events := manager.Events()
 	errs := manager.Errors()
 	if !isCharDevice(os.Stdin) || !isCharDevice(os.Stdout) {
-		return runPlainOutput(ctx, events, errs)
+		return runPlainOutput(ctx, manager)
 	}
 	restore, err := enableRawMode()
 	if err != nil {
-		return runPlainOutput(ctx, events, errs)
+		return runPlainOutput(ctx, manager)
 	}
 	defer restore()
 
@@ -92,15 +92,32 @@ func RunTUI(
 	}
 }
 
-func runPlainOutput(ctx context.Context, events <-chan BodyEvent, errs <-chan error) error {
+// runPlainOutput streams body events as plain lines. While a FreeCAD
+// batch runs, a "...processing N files..." line with the elapsed time is
+// kept on stderr (rewritten in place with \r) so stdout stays line-based.
+func runPlainOutput(ctx context.Context, manager *PrintManager) error {
+	events := manager.Events()
+	errs := manager.Errors()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	busyShown := false
+	clearBusy := func() {
+		if busyShown {
+			busyShown = false
+			fmt.Fprint(os.Stderr, "\r\x1b[K")
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
+			clearBusy()
 			return nil
 		case event, ok := <-events:
 			if !ok {
+				clearBusy()
 				return nil
 			}
+			clearBusy()
 			fmt.Printf("%s %s %s:%s up=%s mat=%s nozzle=%s body=%s\n",
 				event.ChangedAt.Format(time.Stamp), event.Kind,
 				filepath.Base(event.InputPath), event.BodyName,
@@ -108,9 +125,20 @@ func runPlainOutput(ctx context.Context, events <-chan BodyEvent, errs <-chan er
 				event.Settings.Nozzle, event.Settings.Body)
 		case err, ok := <-errs:
 			if !ok {
+				clearBusy()
 				return nil
 			}
+			clearBusy()
 			fmt.Fprintln(os.Stderr, "error:", err)
+		case <-ticker.C:
+			files, since := manager.Processing()
+			if files > 0 {
+				busyShown = true
+				fmt.Fprintf(os.Stderr, "\r...processing %d files... (%s)\x1b[K",
+					files, time.Since(since).Round(time.Second))
+			} else {
+				clearBusy()
+			}
 		}
 	}
 }
@@ -131,7 +159,11 @@ func draw(manager *PrintManager, entries []BodyEvent, status string) {
 	line("fc-print  bodies: %d | FCStd: %d (%d)  (c: clear  q: quit)",
 		bodies, tagged, total)
 	line("%s", strings.Repeat("-", minInt(width, 72)))
+	busyFiles, busySince := manager.Processing()
 	max := height - 4
+	if busyFiles > 0 {
+		max--
+	}
 	if max > 0 && len(entries) > max {
 		line("... %d older", len(entries)-max)
 		entries = entries[:max]
@@ -147,6 +179,10 @@ func draw(manager *PrintManager, entries []BodyEvent, status string) {
 			filepath.Base(event.InputPath), event.BodyName,
 			event.Settings.Up, event.Settings.Mat,
 			event.Settings.Nozzle, event.Settings.Body)
+	}
+	if busyFiles > 0 {
+		line("...processing %d files... (%s)",
+			busyFiles, time.Since(busySince).Round(time.Second))
 	}
 	if status != "" {
 		line("err: %s", status)
